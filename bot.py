@@ -1,16 +1,15 @@
-import asyncio
 import logging
 import os
-import signal
 import sqlite3
 from contextlib import closing
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -18,28 +17,38 @@ from telegram.ext import (
     filters,
 )
 
+from keep_alive import keep_alive
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sharkv1-bot")
+logger = logging.getLogger("sharkv1")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
-UPI_ID = os.getenv("UPI_ID", "").strip()
-BINANCE_ID = os.getenv("BINANCE_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "orders.db").strip() or "orders.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_PATH = "orders.db"
 
+# Advanced product catalog (price optional, useful for better summaries)
 CATALOG: dict[str, dict[str, int]] = {
-    "YT": {"1M": 25, "3M": 149},
-    "Gemini": {"12M": 159},
-    "Spotify": {"2M": 49, "3M": 89},
-    "Crunchyroll": {"1M": 39},
+    "Netflix": {"1 day": 5, "7 days": 20, "30 days": 60},
+    "YouTube Premium": {"1 day": 4, "7 days": 15, "30 days": 45},
+    "Spotify": {"1 day": 3, "7 days": 12, "30 days": 35},
+    "ChatGPT Plus": {"1 day": 6, "7 days": 25, "30 days": 80},
 }
 
-PRODUCTS_REQUIRE_LOGIN = {"Spotify", "Crunchyroll"}
+ACCOUNT_TYPES = ["Basic", "Premium", "VIP"]
+
+WELCOME_TEXT = (
+    "🦈 *SharkV1 Shop*\n"
+    "✅ Premium Services\n"
+    "🔒 Secure Payments\n"
+    "⚡ Instant Delivery\n"
+    "🛟 24/7 Support\n"
+    "👇 Choose a category:"
+)
 
 
+# ------------------------- Database Layer -------------------------
 def db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -47,470 +56,561 @@ def db_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    """Create required SQLite tables if they do not exist."""
     with closing(db_connection()) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                user_id INTEGER,
                 username TEXT,
-                product TEXT NOT NULL,
-                duration TEXT NOT NULL,
-                price INTEGER NOT NULL,
-                account_type TEXT NOT NULL,
-                email TEXT,
-                password TEXT,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                created_at TEXT NOT NULL,
-                payment_txn TEXT
+                product TEXT,
+                duration TEXT,
+                account_type TEXT,
+                details_text TEXT,
+                details_file_id TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT
             )
             """
         )
-    logger.info("Database initialized at %s", DB_PATH)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                message_text TEXT,
+                created_at TEXT,
+                status TEXT DEFAULT 'open'
+            )
+            """
+        )
 
 
-def create_order(payload: dict[str, Any]) -> int:
+def save_order(
+    user_id: int,
+    username: Optional[str],
+    product: str,
+    duration: str,
+    account_type: str,
+    details_text: Optional[str],
+    details_file_id: Optional[str],
+) -> int:
     with closing(db_connection()) as conn, conn:
         cursor = conn.execute(
             """
             INSERT INTO orders (
-                user_id, username, product, duration, price, account_type,
-                email, password, status, created_at, payment_txn
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                user_id, username, product, duration, account_type,
+                details_text, details_file_id, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
             (
-                payload["user_id"],
-                payload.get("username"),
-                payload["product"],
-                payload["duration"],
-                payload["price"],
-                payload["account_type"],
-                payload.get("email"),
-                payload.get("password"),
+                user_id,
+                username,
+                product,
+                duration,
+                account_type,
+                details_text,
+                details_file_id,
                 datetime.utcnow().isoformat(timespec="seconds"),
-                payload.get("payment_txn"),
             ),
         )
         return int(cursor.lastrowid)
 
 
-def update_payment_txn(order_id: int, payment_txn: str) -> None:
-    with closing(db_connection()) as conn, conn:
-        conn.execute(
-            "UPDATE orders SET payment_txn = ?, status = 'PENDING' WHERE id = ?",
-            (payment_txn, order_id),
-        )
-
-
-def update_order_status(order_id: int, status: str) -> None:
-    with closing(db_connection()) as conn, conn:
-        conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
-
-
-def get_order(order_id: int) -> sqlite3.Row | None:
-    with closing(db_connection()) as conn:
-        return conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-
-
 def get_user_orders(user_id: int) -> list[sqlite3.Row]:
     with closing(db_connection()) as conn:
         return conn.execute(
-            "SELECT id, product, duration, status FROM orders WHERE user_id = ? ORDER BY id DESC",
+            """
+            SELECT id, product, duration, status, created_at
+            FROM orders
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
             (user_id,),
         ).fetchall()
 
 
 def get_profile_counts(user_id: int) -> tuple[int, int]:
     with closing(db_connection()) as conn:
-        total = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (user_id,)).fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()[0]
         approved = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE user_id = ? AND status = 'APPROVED'",
+            "SELECT COUNT(*) FROM orders WHERE user_id = ? AND status = 'approved'",
             (user_id,),
         ).fetchone()[0]
     return int(total), int(approved)
 
 
-def main_menu_markup() -> InlineKeyboardMarkup:
+def save_ticket(user_id: int, username: Optional[str], message_text: str) -> int:
+    with closing(db_connection()) as conn, conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO support_tickets (user_id, username, message_text, created_at, status)
+            VALUES (?, ?, ?, ?, 'open')
+            """,
+            (
+                user_id,
+                username,
+                message_text,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+# ------------------------- State Helpers -------------------------
+def get_draft(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any]:
+    return context.user_data.setdefault("draft", {})
+
+
+def clear_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("mode", None)
+    context.user_data.pop("draft", None)
+
+
+# ------------------------- Keyboards -------------------------
+def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🛒 Order", callback_data="menu:order")],
-            [InlineKeyboardButton("📦 My Orders", callback_data="menu:orders")],
-            [InlineKeyboardButton("👤 Profile", callback_data="menu:profile")],
-            [InlineKeyboardButton("📞 Support", callback_data="menu:support")],
+            [
+                InlineKeyboardButton("🛒 Order", callback_data="menu:order"),
+                InlineKeyboardButton("📦 My Orders", callback_data="menu:orders"),
+            ],
+            [
+                InlineKeyboardButton("👤 Profile", callback_data="menu:profile"),
+                InlineKeyboardButton("🛟 Support", callback_data="menu:support"),
+            ],
+            [
+                InlineKeyboardButton("🔥 Offers", callback_data="menu:offers"),
+                InlineKeyboardButton("🧾 How it works", callback_data="menu:how"),
+            ],
         ]
     )
 
 
-def products_markup() -> InlineKeyboardMarkup:
+def home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu:home")]])
+
+
+def products_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(product, callback_data=f"product:{product}")] for product in CATALOG]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home")])
+    rows.append(
+        [
+            InlineKeyboardButton("🏠 Home", callback_data="menu:home"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
-def durations_markup(product: str) -> InlineKeyboardMarkup:
+def durations_keyboard(product: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"{duration} - ₹{price}", callback_data=f"duration:{product}:{duration}")]
+        [InlineKeyboardButton(f"{duration} · ${price}", callback_data=f"duration:{duration}")]
         for duration, price in CATALOG[product].items()
     ]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:order")])
+    rows.append(
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data="back:products"),
+            InlineKeyboardButton("🏠 Home", callback_data="menu:home"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
-async def show_main_menu(target, text: str) -> None:
-    await target(text, reply_markup=main_menu_markup())
+def account_types_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(account, callback_data=f"account:{account}")] for account in ACCOUNT_TYPES]
+    rows.append(
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data="back:durations"),
+            InlineKeyboardButton("🏠 Home", callback_data="menu:home"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
+def details_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Back", callback_data="back:account_types"), InlineKeyboardButton("🏠 Home", callback_data="menu:home")]]
+    )
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Confirm", callback_data="order:confirm")],
+            [
+                InlineKeyboardButton("⬅️ Back", callback_data="back:details"),
+                InlineKeyboardButton("❌ Cancel", callback_data="menu:home"),
+            ],
+        ]
+    )
+
+
+# ------------------------- Text Builders -------------------------
+def render_order_summary(draft: dict[str, Any]) -> str:
+    product = draft.get("product", "-")
+    duration = draft.get("duration", "-")
+    account_type = draft.get("account_type", "-")
+    price = "-"
+    if product in CATALOG and duration in CATALOG[product]:
+        price = f"${CATALOG[product][duration]}"
+
+    details_text = draft.get("details_text")
+    details_file_id = draft.get("details_file_id")
+    if details_text:
+        details = details_text
+    elif details_file_id:
+        details = "[photo uploaded]"
+    else:
+        details = "-"
+
+    return (
+        "*Order Confirmation*\n"
+        f"• Product: `{product}`\n"
+        f"• Duration: `{duration}`\n"
+        f"• Account Type: `{account_type}`\n"
+        f"• Price: `{price}`\n"
+        f"• Details: `{details}`"
+    )
+
+
+async def safe_edit_or_send(query, text: str, reply_markup: InlineKeyboardMarkup, parse_mode: Optional[str] = None) -> None:
+    try:
+        await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except BadRequest:
+        await query.message.reply_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+# ------------------------- Handlers -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.clear()
+    clear_flow(context)
     if update.message:
-        await show_main_menu(update.message.reply_text, "Welcome to SharkV1! Choose an option:")
+        await update.message.reply_text(
+            WELCOME_TEXT,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(),
+        )
 
 
-async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
     await query.answer()
 
-    data = query.data or ""
-    if data == "menu:home":
-        await query.edit_message_text("Main Menu", reply_markup=main_menu_markup())
-    elif data == "menu:order":
-        context.user_data.pop("draft", None)
-        await query.edit_message_text("Choose a product:", reply_markup=products_markup())
-    elif data == "menu:orders":
-        user = query.from_user
-        orders = get_user_orders(user.id)
+    action = query.data or ""
+
+    if action == "menu:home":
+        clear_flow(context)
+        await safe_edit_or_send(
+            query,
+            WELCOME_TEXT,
+            main_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if action == "menu:order":
+        clear_flow(context)
+        context.user_data["draft"] = {}
+        await safe_edit_or_send(
+            query,
+            "*Select a product:*",
+            products_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if action == "menu:orders":
+        orders = get_user_orders(query.from_user.id)
         if not orders:
-            text = "You have no orders yet."
+            text = "📦 You have no orders yet."
         else:
-            text = "\n".join(
-                f"• Order #{row['id']} | {row['product']} {row['duration']} | {row['status']}" for row in orders[:20]
-            )
-        await query.edit_message_text(text, reply_markup=main_menu_markup())
-    elif data == "menu:profile":
-        user = query.from_user
-        total, approved = get_profile_counts(user.id)
-        username = f"@{user.username}" if user.username else "N/A"
+            lines = [
+                f"Order #{row['id']} | {row['product']} | {row['duration']} | {row['status']}"
+                for row in orders
+            ]
+            text = "*📦 Your last 20 orders*\n" + "\n".join(lines)
+
+        await safe_edit_or_send(query, text, home_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if action == "menu:profile":
+        total, approved = get_profile_counts(query.from_user.id)
         text = (
-            "Profile\n"
-            f"User ID: {user.id}\n"
-            f"Username: {username}\n"
+            "*👤 Profile*\n"
             f"Total Orders: {total}\n"
             f"Approved Orders: {approved}"
         )
-        await query.edit_message_text(text, reply_markup=main_menu_markup())
-    elif data == "menu:support":
-        support_text = "Support: Please message this bot with your issue. Our team will respond soon."
-        await query.edit_message_text(support_text, reply_markup=main_menu_markup())
-
-
-async def on_product_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()
-    _, product = query.data.split(":", maxsplit=1)
-    context.user_data["draft"] = {"product": product}
-    await query.edit_message_text(f"Selected {product}. Choose duration:", reply_markup=durations_markup(product))
-
-
-async def on_duration_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()
-    _, product, duration = query.data.split(":", maxsplit=2)
-
-    draft = context.user_data.get("draft", {})
-    draft.update(
-        {
-            "product": product,
-            "duration": duration,
-            "price": CATALOG[product][duration],
-        }
-    )
-    context.user_data["draft"] = draft
-
-    if product in PRODUCTS_REQUIRE_LOGIN:
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Use My Account", callback_data="acct:USER_PROVIDED")],
-                [InlineKeyboardButton("Use Seller Account", callback_data="acct:OUR_ACCOUNT")],
-            ]
-        )
-        await query.edit_message_text("Choose account type:", reply_markup=keyboard)
+        await safe_edit_or_send(query, text, home_keyboard(), parse_mode=ParseMode.MARKDOWN)
         return
 
-    draft["account_type"] = "OUR_ACCOUNT"
-    await query.edit_message_text(render_order_summary(draft), reply_markup=confirm_markup())
-
-
-def render_order_summary(draft: dict[str, Any]) -> str:
-    return (
-        "Order Summary\n"
-        f"Product: {draft.get('product')}\n"
-        f"Duration: {draft.get('duration')}\n"
-        f"Price: ₹{draft.get('price')}\n"
-        f"Account Type: {draft.get('account_type', 'OUR_ACCOUNT')}"
-    )
-
-
-def confirm_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Confirm Order", callback_data="order:confirm")],
-            [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:home")],
-        ]
-    )
-
-
-async def on_account_type_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()
-
-    _, account_type = query.data.split(":", maxsplit=1)
-    draft = context.user_data.get("draft", {})
-    draft["account_type"] = account_type
-    context.user_data["draft"] = draft
-
-    if account_type == "USER_PROVIDED":
-        context.user_data["awaiting_credentials"] = True
-        await query.edit_message_text(
-            "Please send your email and password in this format:\nemail,password"
+    if action == "menu:support":
+        context.user_data["mode"] = "support"
+        await safe_edit_or_send(
+            query,
+            "🛟 *Support*\nPlease type your issue and send it now.",
+            home_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    draft["email"] = None
-    draft["password"] = None
-    await query.edit_message_text(render_order_summary(draft), reply_markup=confirm_markup())
-
-
-async def on_text_or_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user is None or update.message is None:
-        return
-
-    if context.user_data.get("awaiting_credentials"):
-        text = (update.message.text or "").strip()
-        if not text or "," not in text:
-            await update.message.reply_text("Invalid format. Send as: email,password")
-            return
-        email, password = [v.strip() for v in text.split(",", maxsplit=1)]
-        if not email or not password:
-            await update.message.reply_text("Invalid format. Send as: email,password")
-            return
-        draft = context.user_data.get("draft", {})
-        draft["email"] = email
-        draft["password"] = password
-        context.user_data["draft"] = draft
-        context.user_data["awaiting_credentials"] = False
-        await update.message.reply_text(render_order_summary(draft), reply_markup=confirm_markup())
-        return
-
-    pending_order_id = context.user_data.get("awaiting_payment_order_id")
-    if pending_order_id:
-        txn_data = ""
-        if update.message.text:
-            txn_data = update.message.text.strip()
-        elif update.message.photo:
-            txn_data = f"PHOTO_FILE_ID:{update.message.photo[-1].file_id}"
-
-        if not txn_data:
-            await update.message.reply_text("Please send a transaction ID text or a payment screenshot.")
-            return
-
-        update_payment_txn(int(pending_order_id), txn_data)
-        order = get_order(int(pending_order_id))
-        context.user_data["awaiting_payment_order_id"] = None
-
-        await update.message.reply_text(
-            f"Payment evidence received for Order #{pending_order_id}. Awaiting admin review.",
-            reply_markup=main_menu_markup(),
+    if action == "menu:offers":
+        text = (
+            "*🔥 Special Offers*\n"
+            "• 10% OFF on all 30-day plans\n"
+            "• Priority queue for Premium/VIP orders\n"
+            "• Weekend flash discounts on selected products"
         )
-
-        if order:
-            await notify_admin_new_order(context, order)
+        await safe_edit_or_send(query, text, home_keyboard(), parse_mode=ParseMode.MARKDOWN)
         return
 
-    await update.message.reply_text("Use /start to open the menu.")
+    if action == "menu:how":
+        text = (
+            "*🧾 How it works*\n"
+            "1. Tap *Order* and select your product\n"
+            "2. Choose duration and account type\n"
+            "3. Send order details as text or photo\n"
+            "4. Confirm and receive your order ID"
+        )
+        await safe_edit_or_send(query, text, home_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
 
-async def on_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
     await query.answer()
 
-    user = query.from_user
-    draft = context.user_data.get("draft")
-    if not draft:
-        await query.edit_message_text("No active order draft. Please start again.", reply_markup=main_menu_markup())
+    action = (query.data or "").split(":", maxsplit=1)[1]
+    draft = get_draft(context)
+
+    if action == "products":
+        await safe_edit_or_send(query, "*Select a product:*", products_keyboard(), parse_mode=ParseMode.MARKDOWN)
         return
 
-    order_id = create_order(
-        {
-            "user_id": user.id,
-            "username": user.username,
-            "product": draft.get("product"),
-            "duration": draft.get("duration"),
-            "price": draft.get("price"),
-            "account_type": draft.get("account_type", "OUR_ACCOUNT"),
-            "email": draft.get("email"),
-            "password": draft.get("password"),
-            "payment_txn": None,
-        }
-    )
-
-    context.user_data["awaiting_payment_order_id"] = order_id
-    payment_text = (
-        "Payment Instructions:\n"
-        f"UPI: {UPI_ID or 'Not configured'}\n"
-        f"Binance ID: {BINANCE_ID or 'Not configured'}\n\n"
-        f"Order ID: #{order_id}\n"
-        "Click below after payment."
-    )
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("I Have Paid", callback_data=f"paid:{order_id}")], [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu:home")]]
-    )
-    await query.edit_message_text(payment_text, reply_markup=markup)
-
-
-async def on_paid_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()
-
-    _, order_id_str = query.data.split(":", maxsplit=1)
-    context.user_data["awaiting_payment_order_id"] = int(order_id_str)
-    await query.edit_message_text("Send Transaction ID OR upload payment screenshot.")
-
-
-async def notify_admin_new_order(context: ContextTypes.DEFAULT_TYPE, order: sqlite3.Row) -> None:
-    if not ADMIN_CHAT_ID:
-        logger.warning("ADMIN_CHAT_ID not configured. Skipping admin notification for order %s", order["id"])
-        return
-
-    text = (
-        "New Order:\n"
-        f"Order ID: #{order['id']}\n"
-        f"User: {order['username'] or 'N/A'} ({order['user_id']})\n"
-        f"Product: {order['product']}\n"
-        f"Duration: {order['duration']}\n"
-        f"Account Type: {order['account_type']}\n"
-        f"Txn ID: {order['payment_txn'] or 'N/A'}"
-    )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Approve",
-                    callback_data=f"admin:APPROVE:{order['id']}:{order['user_id']}",
-                ),
-                InlineKeyboardButton(
-                    "Reject",
-                    callback_data=f"admin:REJECTED:{order['id']}:{order['user_id']}",
-                ),
-            ]
-        ]
-    )
-
-    try:
-        await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text, reply_markup=keyboard)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to send admin notification: %s", exc)
-
-
-async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()
-
-    if not ADMIN_CHAT_ID:
-        await query.edit_message_text("ADMIN_CHAT_ID not configured.")
-        return
-
-    if str(query.from_user.id) != str(ADMIN_CHAT_ID):
-        await query.answer("Unauthorized", show_alert=True)
-        return
-
-    _, new_status, order_id_str, user_id_str = query.data.split(":", maxsplit=3)
-    order_id = int(order_id_str)
-    user_id = int(user_id_str)
-
-    if new_status == "APPROVE":
-        status_to_set = "APPROVED"
-    else:
-        status_to_set = "REJECTED"
-
-    update_order_status(order_id, status_to_set)
-    await query.edit_message_text(f"Order #{order_id} marked as {status_to_set}.")
-
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"Your Order #{order_id} has been {status_to_set}.",
+    if action == "durations":
+        product = draft.get("product")
+        if not product:
+            await safe_edit_or_send(query, "*Select a product:*", products_keyboard(), parse_mode=ParseMode.MARKDOWN)
+            return
+        await safe_edit_or_send(
+            query,
+            f"*{product}*\nSelect duration:",
+            durations_keyboard(product),
+            parse_mode=ParseMode.MARKDOWN,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not notify user %s for order %s: %s", user_id, order_id, exc)
+        return
+
+    if action == "account_types":
+        await safe_edit_or_send(query, "Select account type:", account_types_keyboard())
+        return
+
+    if action == "details":
+        context.user_data["mode"] = "order_details"
+        await safe_edit_or_send(query, "Send details (text) or upload photo", details_keyboard())
+
+
+async def on_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    product = (query.data or "").split(":", maxsplit=1)[1]
+    if product not in CATALOG:
+        await safe_edit_or_send(query, "Invalid product. Please choose again.", products_keyboard())
+        return
+
+    draft = get_draft(context)
+    draft["product"] = product
+    draft.pop("duration", None)
+    draft.pop("account_type", None)
+    draft.pop("details_text", None)
+    draft.pop("details_file_id", None)
+
+    await safe_edit_or_send(
+        query,
+        f"*{product}*\nSelect duration:",
+        durations_keyboard(product),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def on_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    duration = (query.data or "").split(":", maxsplit=1)[1]
+    draft = get_draft(context)
+    product = draft.get("product")
+
+    if not product or product not in CATALOG:
+        await safe_edit_or_send(query, "Please select a product first.", products_keyboard())
+        return
+    if duration not in CATALOG[product]:
+        await safe_edit_or_send(query, "Invalid duration. Please choose again.", durations_keyboard(product))
+        return
+
+    draft["duration"] = duration
+    draft.pop("account_type", None)
+    draft.pop("details_text", None)
+    draft.pop("details_file_id", None)
+
+    await safe_edit_or_send(query, "Select account type:", account_types_keyboard())
+
+
+async def on_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    account_type = (query.data or "").split(":", maxsplit=1)[1]
+    if account_type not in ACCOUNT_TYPES:
+        await safe_edit_or_send(query, "Invalid account type. Please choose again.", account_types_keyboard())
+        return
+
+    draft = get_draft(context)
+    if not draft.get("product") or not draft.get("duration"):
+        await safe_edit_or_send(query, "Please select product and duration first.", products_keyboard())
+        return
+
+    draft["account_type"] = account_type
+    draft.pop("details_text", None)
+    draft.pop("details_file_id", None)
+    context.user_data["mode"] = "order_details"
+
+    await safe_edit_or_send(query, "Send details (text) or upload photo", details_keyboard())
+
+
+async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    draft = context.user_data.get("draft", {})
+    required = ("product", "duration", "account_type")
+    if any(not draft.get(key) for key in required):
+        await safe_edit_or_send(
+            query,
+            "Order draft is incomplete. Please start again.",
+            home_keyboard(),
+        )
+        return
+
+    if not draft.get("details_text") and not draft.get("details_file_id"):
+        context.user_data["mode"] = "order_details"
+        await safe_edit_or_send(query, "Please send details first (text or photo).", details_keyboard())
+        return
+
+    order_id = save_order(
+        user_id=query.from_user.id,
+        username=query.from_user.username,
+        product=draft["product"],
+        duration=draft["duration"],
+        account_type=draft["account_type"],
+        details_text=draft.get("details_text"),
+        details_file_id=draft.get("details_file_id"),
+    )
+
+    clear_flow(context)
+    await safe_edit_or_send(query, f"✅ Order placed! Order ID: {order_id}", home_keyboard())
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    mode = context.user_data.get("mode")
+
+    if mode == "support":
+        ticket_text = (update.message.text or "").strip()
+        if not ticket_text:
+            await update.message.reply_text("Please send your issue as text.")
+            return
+
+        ticket_id = save_ticket(
+            user_id=update.effective_user.id,
+            username=update.effective_user.username,
+            message_text=ticket_text,
+        )
+        context.user_data.pop("mode", None)
+        await update.message.reply_text(
+            f"✅ Support request sent! Ticket #{ticket_id}",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    if mode == "order_details":
+        draft = get_draft(context)
+
+        if update.message.text:
+            details = update.message.text.strip()
+            if not details:
+                await update.message.reply_text("Details cannot be empty. Send text or upload photo.")
+                return
+            draft["details_text"] = details
+            draft["details_file_id"] = None
+        elif update.message.photo:
+            draft["details_text"] = None
+            draft["details_file_id"] = update.message.photo[-1].file_id
+        else:
+            await update.message.reply_text("Please send details as text or upload a photo.")
+            return
+
+        context.user_data.pop("mode", None)
+        await update.message.reply_text(
+            render_order_summary(draft),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=confirm_keyboard(),
+        )
+        return
+
+    await update.message.reply_text(
+        "Use /start to open the main menu.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error: %s", context.error)
 
 
 def build_application() -> Application:
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(on_menu_click, pattern=r"^menu:"))
-    application.add_handler(CallbackQueryHandler(on_product_click, pattern=r"^product:"))
-    application.add_handler(CallbackQueryHandler(on_duration_click, pattern=r"^duration:"))
-    application.add_handler(CallbackQueryHandler(on_account_type_click, pattern=r"^acct:"))
-    application.add_handler(CallbackQueryHandler(on_order_confirm, pattern=r"^order:confirm$"))
-    application.add_handler(CallbackQueryHandler(on_paid_click, pattern=r"^paid:"))
-    application.add_handler(CallbackQueryHandler(on_admin_action, pattern=r"^admin:"))
-    application.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, on_text_or_photo))
+    application.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(back_router, pattern=r"^back:"))
+    application.add_handler(CallbackQueryHandler(on_product, pattern=r"^product:"))
+    application.add_handler(CallbackQueryHandler(on_duration, pattern=r"^duration:"))
+    application.add_handler(CallbackQueryHandler(on_account, pattern=r"^account:"))
+    application.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^order:confirm$"))
+    application.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, on_message))
+    application.add_error_handler(on_error)
 
     return application
 
 
-async def run_bot() -> None:
+def main() -> None:
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is required. Set BOT_TOKEN environment variable.")
-        return
+        raise RuntimeError("BOT_TOKEN is missing. Please set BOT_TOKEN environment variable.")
 
     init_db()
+    keep_alive()
+
     app = build_application()
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            logger.warning("Signal handlers not supported on this platform.")
-
-    await app.initialize()
-    await app.start()
-    if app.updater is None:
-        logger.error("Updater failed to initialize.")
-        return
-
-    await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot polling started")
-
-    try:
-        await stop_event.wait()
-    finally:
-        logger.info("Stopping bot...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        logger.info("Bot stopped gracefully")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_bot())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot terminated")
+    main()
