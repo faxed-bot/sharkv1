@@ -406,6 +406,7 @@ async def back_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.MARKDOWN,
         )
         return
+    await query.answer()
 
     if action == "account_types":
         await safe_edit_or_send(query, "Select account type:", account_types_keyboard())
